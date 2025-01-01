@@ -44,15 +44,16 @@ Future work may extend this project to include additional soil parameters, such 
 
 ## Gantt Chart for Extended Project IPROJ3999-l  
 
-| Phase                          | Timeline    |  
-|--------------------------------|-------------|  
-| Problem Definition             | Week 1-2    |  
-| Data Collection & Preprocessing | Week 3-4    |  
-| Model Selection & Development  | Week 5-6    |  
-| Model Training & Testing       | Week 7-10   |  
-| Evaluation & Refinement        | Week 11-12  |  
+| Phase                          | Week 1-2   | Week 3-4 | Week 5-6 | Week 7-10 | Week 11-12 |  
+|--------------------------------|------------|----------|----------|------------|------------|  
+| Problem Definition             |      x     |          |          |            |            |  
+| Data Collection & Preprocessing|            |    x     |          |            |            |  
+| Model Selection & Development  |            |          |    x     |            |            |  
+| Model Training & Testing       |            |          |          |      x     |            |  
+| Evaluation & Refinement        |            |          |          |            |      x     |  
 
 ---
+
 
 ## IEEE Conference Targets  
 1. 3rd International Conference on Computer, Electronics, Electrical Engineering and Their Applications.  

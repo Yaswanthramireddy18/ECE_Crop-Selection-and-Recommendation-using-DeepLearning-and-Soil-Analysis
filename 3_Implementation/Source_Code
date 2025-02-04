@@ -2,223 +2,257 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, applications, optimizers, callbacks
 from tensorflow.keras.utils import image_dataset_from_directory
 import matplotlib.pyplot as plt
+import numpy as np
+from collections import Counter
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+# ======================
+# Dataset Configuration
+# ======================
+# Mount Google Drive
 from google.colab import drive
 drive.mount('/content/drive')
 
-# ======================
-# Data Preparation
-# ======================
-
-# Dataset parameters
+# Constants
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
-NUM_CLASSES = 4  # Update with your soil classes
+NUM_CLASSES = 4
+SEED = 42
+BASE_DIR = '/content/drive/MyDrive/sem-4AIML/soil_detection/organized_dataset'
 
-# Data augmentation
+# ======================
+# Data Loading & Preprocessing
+# ======================
+# Load training set first to get class names
+train_ds = image_dataset_from_directory(
+    f'{BASE_DIR}/train',
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    seed=SEED,
+    label_mode='int'
+)
+class_names = train_ds.class_names
+
+# Load validation and test sets with consistent class order
+val_ds = image_dataset_from_directory(
+    f'{BASE_DIR}/validation',
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_names=class_names,
+    shuffle=False,
+    label_mode='int'
+)
+
+test_ds = image_dataset_from_directory(
+    f'{BASE_DIR}/test',
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_names=class_names,
+    shuffle=False,
+    label_mode='int'
+)
+
+# Calculate class weights
+def get_class_weights(dataset):
+    class_counts = Counter(np.concatenate([y.numpy() for _, y in dataset]))
+    total = sum(class_counts.values())
+    return {cls: total/(len(class_counts)*count) for cls, count in class_counts.items()}
+
+class_weights = get_class_weights(train_ds)
+print("Class weights:", class_weights)
+
+# ======================
+# Data Augmentation & Preprocessing
+# ======================
+# Enhanced augmentation
 data_augmentation = tf.keras.Sequential([
-    layers.RandomFlip("horizontal"),
-    layers.RandomRotation(0.2),
+    layers.RandomFlip("horizontal_and_vertical"),
+    layers.RandomRotation(0.3),
     layers.RandomZoom(0.2),
     layers.RandomContrast(0.2),
+    layers.RandomBrightness(0.2),
+    layers.GaussianNoise(0.01),
 ])
 
-def prepare_train(dataset):
-    return dataset.map(
-        lambda x, y: (data_augmentation(x, training=True), y),
-        num_parallel_calls=tf.data.AUTOTUNE
-    ).prefetch(tf.data.AUTOTUNE)
+# EfficientNet preprocessing
+def preprocess(image, label):
+    image = applications.efficientnet.preprocess_input(image)
+    return image, label
 
-def prepare_val_test(dataset):
-    return dataset.prefetch(tf.data.AUTOTUNE)
+# Prepare datasets
+def prepare(ds, augment=False):
+    ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    if augment:
+        ds = ds.map(lambda x, y: (data_augmentation(x, training=True), y),
+                   num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.prefetch(buffer_size=tf.data.AUTOTUNE)
 
-# Load datasets with corrected paths
-train_ds = image_dataset_from_directory(
-    '/content/drive/MyDrive/sem-4AIML/soil_detection/organized_dataset/train',  # Changed to train
-    image_size=IMG_SIZE,
-    batch_size=BATCH_SIZE)
-val_ds = image_dataset_from_directory(
-    '/content/drive/MyDrive/sem-4AIML/soil_detection/organized_dataset/validation',
-    image_size=IMG_SIZE,
-    batch_size=BATCH_SIZE)
-test_ds = image_dataset_from_directory(
-    '/content/drive/MyDrive/sem-4AIML/soil_detection/organized_dataset/test',
-    image_size=IMG_SIZE,
-    batch_size=BATCH_SIZE)
-
-train_ds = prepare_train(train_ds)
-val_ds = prepare_val_test(val_ds)
-test_ds = prepare_val_test(test_ds)
+train_ds = prepare(train_ds, augment=True)
+val_ds = prepare(val_ds)
+test_ds = prepare(test_ds)
 
 # ======================
-# Custom Model Architecture
+# Model Architecture
 # ======================
+def build_model():
+    base_model = applications.EfficientNetB0(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(224, 224, 3)
+    )
 
-class SoilNet(tf.keras.Model):
-    def __init__(self, num_classes):
-        super(SoilNet, self).__init__()
+    # Freeze base model initially
+    base_model.trainable = False
 
-        # Base model (EfficientNet B0)
-        self.base_model = applications.EfficientNetB0(
-            include_top=False,
-            weights='imagenet',
-            input_shape=(224, 224, 3)
-        )
-        self.base_model.trainable = False  # Freeze initially
+    inputs = tf.keras.Input(shape=(224, 224, 3))
+    x = base_model(inputs, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
 
-        # Custom layers
-        self.c1 = layers.Conv2D(32, (3,3), activation='relu', padding='same')
-        self.dw1 = layers.DepthwiseConv2D((3,3), depth_multiplier=2, activation='relu')
-        self.se1 = SqueezeExcite(64)
+    return tf.keras.Model(inputs, outputs)
 
-        self.c2 = layers.Conv2D(64, (3,3), activation='relu', padding='same')
-        self.dw2 = layers.DepthwiseConv2D((3,3), depth_multiplier=2, activation='relu')
-        self.se2 = SqueezeExcite(128)
+model = build_model()
 
-        self.attention = SpatialAttention()
-        self.ppm = PyramidPoolingModule()
-        self.gap = layers.GlobalAveragePooling2D()
-        self.dense1 = layers.Dense(128, activation='relu')
-        self.dropout = layers.Dropout(0.5)
-        self.output_layer = layers.Dense(num_classes, activation='softmax')
-
-    def call(self, inputs):
-        x = self.base_model(inputs)
-        x = self.c1(x)
-        x = self.dw1(x)
-        x = self.se1(x)
-        x = self.attention(x)
-
-        x = self.c2(x)
-        x = self.dw2(x)
-        x = self.se2(x)
-        x = self.ppm(x)
-
-        x = self.gap(x)
-        x = self.dense1(x)
-        x = self.dropout(x)
-        return self.output_layer(x)
-
-# Custom Layers
-class SqueezeExcite(layers.Layer):
-    def __init__(self, filters, ratio=16):
-        super(SqueezeExcite, self).__init__()
-        self.filters = filters
-        self.ratio = ratio
-
-    def build(self, input_shape):
-        self.se = tf.keras.Sequential([
-            layers.GlobalAveragePooling2D(),
-            layers.Dense(self.filters//self.ratio, activation='relu'),
-            layers.Dense(self.filters, activation='sigmoid'),
-            layers.Reshape((1, 1, self.filters))
-        ])
-
-    def call(self, inputs):
-        return inputs * self.se(inputs)
-
-class SpatialAttention(layers.Layer):
-    def __init__(self):
-        super(SpatialAttention, self).__init__()
-        self.conv = layers.Conv2D(1, (7,7), padding='same', activation='sigmoid')
-
-    def call(self, inputs):
-        avg_out = tf.reduce_mean(inputs, axis=3, keepdims=True)
-        max_out = tf.reduce_max(inputs, axis=3, keepdims=True)
-        x = tf.concat([avg_out, max_out], axis=3)
-        return self.conv(x) * inputs
-
-class PyramidPoolingModule(layers.Layer):
-    def __init__(self, bin_sizes=[1,2,3,6]):
-        super(PyramidPoolingModule, self).__init__()
-        self.bin_sizes = bin_sizes
-        self.conv = layers.Conv2D(64, 1, activation='relu')
-
-    def pool(self, inputs, size):
-        # Use static shape information instead of dynamic tensors
-        h = inputs.shape[1]
-        w = inputs.shape[2]
-
-        # Ensure minimum pool size of 1
-        pool_h = max(1, h // size)
-        pool_w = max(1, w // size)
-
-        x = layers.AveragePooling2D((pool_h, pool_w))(inputs)
-        x = self.conv(x)
-        return tf.image.resize(x, (h, w))
-
-    def call(self, inputs):
-        features = [inputs]
-        for size in self.bin_sizes:
-            pooled = self.pool(inputs, size)
-            features.append(pooled)
-        return tf.concat(features, axis=-1)
 # ======================
-# Model Configuration
+# Training Configuration
 # ======================
+# Custom cosine decay with warmup
+class WarmupCosineDecay(callbacks.Callback):
+    def _init_(self, total_steps, warmup_steps, initial_lr):
+        super()._init_()
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.initial_lr = initial_lr
 
-model = SoilNet(num_classes=NUM_CLASSES)
+    def on_train_begin(self, logs=None):
+        self.step = 0
 
-# Initial training with frozen base
-lr_schedule = optimizers.schedules.CosineDecay(1e-3, 1000)
-optimizer = optimizers.AdamW(learning_rate=lr_schedule)
+    def on_batch_end(self, batch, logs=None):
+        self.step += 1
+        if self.step < self.warmup_steps:
+            lr = self.initial_lr * (self.step/self.warmup_steps)
+        else:
+            progress = (self.step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            lr = 0.5 * self.initial_lr * (1 + np.cos(np.pi * progress))
 
-model.compile(
-    optimizer=optimizer,
-    loss='sparse_categorical_crossentropy',
-    metrics=['accuracy']
-)
+        tf.keras.backend.set_value(self.model.optimizer.lr, lr)
 
 # Callbacks
 callbacks = [
-    callbacks.ModelCheckpoint('best_model.keras', save_best_only=True),
-    callbacks.EarlyStopping(patience=10, restore_best_weights=True),
-    callbacks.ReduceLROnPlateau(factor=0.5, patience=3)
+    callbacks.ModelCheckpoint(
+        'best_model.keras',
+        save_best_only=True,
+        monitor='val_accuracy',
+        mode='max'
+    ),
+    callbacks.EarlyStopping(
+        patience=15,
+        restore_best_weights=True,
+        monitor='val_accuracy'
+    ),
+    callbacks.ReduceLROnPlateau(
+        monitor='val_accuracy',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-7
+    )
 ]
 
+# ======================
+# Training Process
+# ======================
 # Initial training
-history = model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=30,
-    callbacks=callbacks
-)
-
-# Fine-tuning phase
-model.base_model.trainable = True
-for layer in model.base_model.layers[:100]:
-    layer.trainable = False
-
 model.compile(
-    optimizer=optimizers.AdamW(1e-5),
+    optimizer=optimizers.Adam(1e-3, clipnorm=1.0),
     loss='sparse_categorical_crossentropy',
     metrics=['accuracy']
 )
 
+initial_epochs = 30
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=initial_epochs,
+    class_weight=class_weights,
+    callbacks=callbacks
+)
+
+# Fine-tuning
+model = tf.keras.models.load_model('best_model.keras')
+model.trainable = True
+
+# Unfreeze top 50 layers
+for layer in model.layers[1].layers[-50:]:
+    layer.trainable = True
+
+model.compile(
+    optimizer=optimizers.Adam(1e-5, clipnorm=1.0),
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+fine_tune_epochs = 20
 history_fine = model.fit(
     train_ds,
     validation_data=val_ds,
-    epochs=20,
-    initial_epoch=history.epoch[-1],
+    initial_epoch=history.epoch[-1] + 1,
+    epochs=history.epoch[-1] + fine_tune_epochs,
+    class_weight=class_weights,
     callbacks=callbacks
 )
 
 # ======================
 # Evaluation
 # ======================
-model.evaluate(test_ds)
+# Final evaluation
+def evaluate_model(dataset):
+    y_true = []
+    y_pred = []
 
+    for images, labels in dataset:
+        y_true.extend(labels.numpy())
+        preds = model.predict(images, verbose=0)
+        y_pred.extend(np.argmax(preds, axis=1))
 
-# Generate predictions
-y_pred = model.predict(test_ds)
-y_pred = tf.argmax(y_pred, axis=1)
+    print(classification_report(y_true, y_pred))
 
-# Generate confusion matrix
-from sklearn.metrics import confusion_matrix, classification_report
-import seaborn as sns
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.show()
 
-y_true = tf.concat([y for x, y in test_ds], axis=0)
-cm = confusion_matrix(y_true, y_pred)
-sns.heatmap(cm, annot=True, fmt='d')
-plt.show()
+print("Validation Set Evaluation:")
+evaluate_model(val_ds)
 
-print(classification_report(y_true, y_pred))
+print("\nTest Set Evaluation:")
+evaluate_model(test_ds)
+
+# ======================
+# Visualization
+# ======================
+def plot_training_curves(history):
+    acc = history.history['accuracy']
+    val_acc = history.history['val_accuracy']
+    loss = history.history['loss']
+    val_loss = history.history['val_loss']
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(acc, label='Training Accuracy')
+    plt.plot(val_acc, label='Validation Accuracy')
+    plt.legend()
+    plt.title('Accuracy Curves')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(loss, label='Training Loss')
+    plt.plot(val_loss, label='Validation Loss')
+    plt.legend()
+    plt.title('Loss Curves')
+    plt.show()
+
+plot_training_curves(history_fine)

@@ -1,1 +1,224 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, applications, optimizers, callbacks
+from tensorflow.keras.utils import image_dataset_from_directory
+import matplotlib.pyplot as plt
+from google.colab import drive
+drive.mount('/content/drive')
 
+# ======================
+# Data Preparation
+# ======================
+
+# Dataset parameters
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+NUM_CLASSES = 4  # Update with your soil classes
+
+# Data augmentation
+data_augmentation = tf.keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.2),
+    layers.RandomZoom(0.2),
+    layers.RandomContrast(0.2),
+])
+
+def prepare_train(dataset):
+    return dataset.map(
+        lambda x, y: (data_augmentation(x, training=True), y),
+        num_parallel_calls=tf.data.AUTOTUNE
+    ).prefetch(tf.data.AUTOTUNE)
+
+def prepare_val_test(dataset):
+    return dataset.prefetch(tf.data.AUTOTUNE)
+
+# Load datasets with corrected paths
+train_ds = image_dataset_from_directory(
+    '/content/drive/MyDrive/sem-4AIML/soil_detection/organized_dataset/train',  # Changed to train
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE)
+val_ds = image_dataset_from_directory(
+    '/content/drive/MyDrive/sem-4AIML/soil_detection/organized_dataset/validation',
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE)
+test_ds = image_dataset_from_directory(
+    '/content/drive/MyDrive/sem-4AIML/soil_detection/organized_dataset/test',
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE)
+
+train_ds = prepare_train(train_ds)
+val_ds = prepare_val_test(val_ds)
+test_ds = prepare_val_test(test_ds)
+
+# ======================
+# Custom Model Architecture
+# ======================
+
+class SoilNet(tf.keras.Model):
+    def __init__(self, num_classes):
+        super(SoilNet, self).__init__()
+
+        # Base model (EfficientNet B0)
+        self.base_model = applications.EfficientNetB0(
+            include_top=False,
+            weights='imagenet',
+            input_shape=(224, 224, 3)
+        )
+        self.base_model.trainable = False  # Freeze initially
+
+        # Custom layers
+        self.c1 = layers.Conv2D(32, (3,3), activation='relu', padding='same')
+        self.dw1 = layers.DepthwiseConv2D((3,3), depth_multiplier=2, activation='relu')
+        self.se1 = SqueezeExcite(64)
+
+        self.c2 = layers.Conv2D(64, (3,3), activation='relu', padding='same')
+        self.dw2 = layers.DepthwiseConv2D((3,3), depth_multiplier=2, activation='relu')
+        self.se2 = SqueezeExcite(128)
+
+        self.attention = SpatialAttention()
+        self.ppm = PyramidPoolingModule()
+        self.gap = layers.GlobalAveragePooling2D()
+        self.dense1 = layers.Dense(128, activation='relu')
+        self.dropout = layers.Dropout(0.5)
+        self.output_layer = layers.Dense(num_classes, activation='softmax')
+
+    def call(self, inputs):
+        x = self.base_model(inputs)
+        x = self.c1(x)
+        x = self.dw1(x)
+        x = self.se1(x)
+        x = self.attention(x)
+
+        x = self.c2(x)
+        x = self.dw2(x)
+        x = self.se2(x)
+        x = self.ppm(x)
+
+        x = self.gap(x)
+        x = self.dense1(x)
+        x = self.dropout(x)
+        return self.output_layer(x)
+
+# Custom Layers
+class SqueezeExcite(layers.Layer):
+    def __init__(self, filters, ratio=16):
+        super(SqueezeExcite, self).__init__()
+        self.filters = filters
+        self.ratio = ratio
+
+    def build(self, input_shape):
+        self.se = tf.keras.Sequential([
+            layers.GlobalAveragePooling2D(),
+            layers.Dense(self.filters//self.ratio, activation='relu'),
+            layers.Dense(self.filters, activation='sigmoid'),
+            layers.Reshape((1, 1, self.filters))
+        ])
+
+    def call(self, inputs):
+        return inputs * self.se(inputs)
+
+class SpatialAttention(layers.Layer):
+    def __init__(self):
+        super(SpatialAttention, self).__init__()
+        self.conv = layers.Conv2D(1, (7,7), padding='same', activation='sigmoid')
+
+    def call(self, inputs):
+        avg_out = tf.reduce_mean(inputs, axis=3, keepdims=True)
+        max_out = tf.reduce_max(inputs, axis=3, keepdims=True)
+        x = tf.concat([avg_out, max_out], axis=3)
+        return self.conv(x) * inputs
+
+class PyramidPoolingModule(layers.Layer):
+    def __init__(self, bin_sizes=[1,2,3,6]):
+        super(PyramidPoolingModule, self).__init__()
+        self.bin_sizes = bin_sizes
+        self.conv = layers.Conv2D(64, 1, activation='relu')
+
+    def pool(self, inputs, size):
+        # Use static shape information instead of dynamic tensors
+        h = inputs.shape[1]
+        w = inputs.shape[2]
+
+        # Ensure minimum pool size of 1
+        pool_h = max(1, h // size)
+        pool_w = max(1, w // size)
+
+        x = layers.AveragePooling2D((pool_h, pool_w))(inputs)
+        x = self.conv(x)
+        return tf.image.resize(x, (h, w))
+
+    def call(self, inputs):
+        features = [inputs]
+        for size in self.bin_sizes:
+            pooled = self.pool(inputs, size)
+            features.append(pooled)
+        return tf.concat(features, axis=-1)
+# ======================
+# Model Configuration
+# ======================
+
+model = SoilNet(num_classes=NUM_CLASSES)
+
+# Initial training with frozen base
+lr_schedule = optimizers.schedules.CosineDecay(1e-3, 1000)
+optimizer = optimizers.AdamW(learning_rate=lr_schedule)
+
+model.compile(
+    optimizer=optimizer,
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+# Callbacks
+callbacks = [
+    callbacks.ModelCheckpoint('best_model.keras', save_best_only=True),
+    callbacks.EarlyStopping(patience=10, restore_best_weights=True),
+    callbacks.ReduceLROnPlateau(factor=0.5, patience=3)
+]
+
+# Initial training
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=30,
+    callbacks=callbacks
+)
+
+# Fine-tuning phase
+model.base_model.trainable = True
+for layer in model.base_model.layers[:100]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=optimizers.AdamW(1e-5),
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+history_fine = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=20,
+    initial_epoch=history.epoch[-1],
+    callbacks=callbacks
+)
+
+# ======================
+# Evaluation
+# ======================
+model.evaluate(test_ds)
+
+
+# Generate predictions
+y_pred = model.predict(test_ds)
+y_pred = tf.argmax(y_pred, axis=1)
+
+# Generate confusion matrix
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+
+y_true = tf.concat([y for x, y in test_ds], axis=0)
+cm = confusion_matrix(y_true, y_pred)
+sns.heatmap(cm, annot=True, fmt='d')
+plt.show()
+
+print(classification_report(y_true, y_pred))

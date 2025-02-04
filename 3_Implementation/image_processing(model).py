@@ -120,8 +120,8 @@ model = build_model()
 # ======================
 # Custom cosine decay with warmup
 class WarmupCosineDecay(callbacks.Callback):
-    def _init_(self, total_steps, warmup_steps, initial_lr):
-        super()._init_()
+    def __init__(self, total_steps, warmup_steps, initial_lr):
+        super().__init__()
         self.total_steps = total_steps
         self.warmup_steps = warmup_steps
         self.initial_lr = initial_lr
